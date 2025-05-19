@@ -383,4 +383,59 @@ contract TokenICO is Ownable, ReentrancyGuard, Pausable {
             intervals
         );
     }
+
+
+    /**
+     * @dev Allows users to release their vested tokens via the ICO contract.
+     */
+    function releaseVestedTokens() external nonReentrant {
+        require(
+            userVestingWallets[msg.sender] != address(0),
+            "No vesting wallet found"
+        );
+
+        IVestingWalletWithIntervals vestingWallet = IVestingWalletWithIntervals(
+            userVestingWallets[msg.sender]
+        );
+
+        vestingWallet.release(address(token)); // Releases the ICO token
+    }
+
+    /**
+     * @dev Returns the amount of tokens that have vested for a user at the current block timestamp.
+     * @param user The address of the user to check
+     * @return The amount of vested tokens (in wei)
+     */
+    function getVestedTokens(address user) external view returns (uint256) {
+        require(
+            userVestingWallets[user] != address(0),
+            "No vesting wallet found"
+        );
+
+        IVestingWalletWithIntervals vestingWallet = IVestingWalletWithIntervals(
+            userVestingWallets[user]
+        );
+
+        // Returns vested tokens up to current time
+        return
+            vestingWallet.vestedAmount(address(token), uint64(block.timestamp));
+    }
+
+    /**
+     * @dev Returns the amount of tokens already claimed by the user.
+     * @param user The address of the user to check
+     * @return The amount of claimed tokens (in wei)
+     */
+    function getClaimedTokens(address user) external view returns (uint256) {
+        require(
+            userVestingWallets[user] != address(0),
+            "No vesting wallet found"
+        );
+
+        IVestingWalletWithIntervals vestingWallet = IVestingWalletWithIntervals(
+            userVestingWallets[user]
+        );
+
+        return vestingWallet.released(address(token));
+    }
 }
