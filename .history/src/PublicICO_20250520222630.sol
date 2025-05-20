@@ -39,13 +39,10 @@ contract TokenICO is Ownable, ReentrancyGuard, Pausable {
     uint256 public unsoldTokensApproved;
 
     // Mapping of user addresses to their vesting wallet addresses
-    mapping(address => address[]) public userVestingWallets;
+    mapping(address => address) public userVestingWallets;
 
     // Mapping to track total tokens allocated to vesting per user
     mapping(address => uint256) public userVestedTokens;
-
-    // Mapping to track tokens in each vesting wallet
-    mapping(address => uint256) public vestingWalletTokens;
 
     // **** Events **** ///
     event TokenPurchasedWithEth(
@@ -137,27 +134,24 @@ contract TokenICO is Ownable, ReentrancyGuard, Pausable {
         weiRaised += msg.value;
 
         if (vestingEnabled) {
-            // Always create a new vesting wallet for each purchase
-            address vestingWallet = vestingFactory.createVestingWallet(
-                msg.sender, // beneficiary
-                uint64(block.timestamp), // startTimestamp - current time for each purchase
-                vestingDuration, // durationSeconds
-                vestingCliff, // cliffSeconds
-                releaseInterval // releaseIntervalSeconds
-            );
+            // Create a vesting wallet for the user if they don't have one yet
+            if (userVestingWallets[msg.sender] == address(0)) {
+                address vestingWallet = vestingFactory.createVestingWallet(
+                    msg.sender, // beneficiary
+                    uint64(block.timestamp), // startTimestamp
+                    vestingDuration, // durationSeconds
+                    vestingCliff, // cliffSeconds
+                    releaseInterval // releaseIntervalSeconds
+                );
+                userVestingWallets[msg.sender] = vestingWallet;
+                emit VestingWalletCreated(msg.sender, vestingWallet, tokens);
+            }
 
-            // Add to array of user's vesting wallets
-            userVestingWallets[msg.sender].push(vestingWallet);
-
-            // Track tokens in this specific wallet
-            vestingWalletTokens[vestingWallet] = tokens;
-
-            // Send tokens to the new vesting wallet
-            token.safeTransfer(vestingWallet, tokens);
+            // Send tokens to the vesting wallet
+            token.safeTransfer(userVestingWallets[msg.sender], tokens);
             userVestedTokens[msg.sender] += tokens;
 
-            emit VestingWalletCreated(msg.sender, vestingWallet, tokens);
-            emit VestingWalletFunded(vestingWallet, tokens);
+            emit VestingWalletFunded(userVestingWallets[msg.sender], tokens);
         } else {
             // Direct transfer if vesting is not enabled
             token.safeTransfer(msg.sender, tokens);
@@ -342,20 +336,23 @@ contract TokenICO is Ownable, ReentrancyGuard, Pausable {
         emit UnsoldTokensWithdrawn(_wallet, amount);
     }
 
-    // Update the getVestingDetails function to return data about all wallets
-    function getVestingWallets(
+    /**
+     * @dev Get vesting wallet details for a user
+     * @param _user Address of the user
+     * @return wallet Address of the user's vesting wallet
+     * @return vestedAmount Total amount of tokens vested for this user
+     * @return vestingStart Start timestamp of vesting
+     * @return vestingEnd End timestamp of vesting
+     * @return vestingCliffEnd Cliff end timestamp
+     * @return intervals Array of release timestamps
+     */
+    function getVestingDetails(
         address _user
-    ) external view returns (address[] memory) {
-        return userVestingWallets[_user];
-    }
-
-    // Get details for a specific wallet
-    function getVestingWalletDetails(
-        address _wallet
     )
         external
         view
         returns (
+            address wallet,
             uint256 vestedAmount,
             uint256 vestingStart,
             uint256 vestingEnd,
@@ -363,18 +360,22 @@ contract TokenICO is Ownable, ReentrancyGuard, Pausable {
             uint256[] memory intervals
         )
     {
-        require(_wallet != address(0), "Invalid wallet address");
+        wallet = userVestingWallets[_user];
+        if (wallet == address(0)) {
+            return (address(0), 0, 0, 0, 0, new uint256[](0));
+        }
 
+        vestedAmount = userVestedTokens[_user];
         IVestingWalletWithIntervals vestingWallet = IVestingWalletWithIntervals(
-            _wallet
+            wallet
         );
-        vestedAmount = vestingWalletTokens[_wallet];
         vestingStart = vestingWallet.start();
         vestingEnd = vestingStart + vestingWallet.duration();
         vestingCliffEnd = vestingStart + vestingWallet.cliff();
         intervals = vestingWallet.getReleaseTimestamps();
 
         return (
+            wallet,
             vestedAmount,
             vestingStart,
             vestingEnd,
@@ -383,38 +384,57 @@ contract TokenICO is Ownable, ReentrancyGuard, Pausable {
         );
     }
 
-    // Release tokens from a specific vesting wallet
-    function releaseVestedTokens(address vestingWallet) external nonReentrant {
-        bool isUsersWallet = false;
-        address[] memory userWallets = userVestingWallets[msg.sender];
-
-        for (uint i = 0; i < userWallets.length; i++) {
-            if (userWallets[i] == vestingWallet) {
-                isUsersWallet = true;
-                break;
-            }
-        }
-
-        require(isUsersWallet, "Not your vesting wallet");
-
-        IVestingWalletWithIntervals wallet = IVestingWalletWithIntervals(
-            vestingWallet
+    /**
+     * @dev Allows users to release their vested tokens via the ICO contract.
+     */
+    function releaseVestedTokens() external nonReentrant {
+        require(
+            userVestingWallets[msg.sender] != address(0),
+            "No vesting wallet found"
         );
-        wallet.release(address(token));
+
+        IVestingWalletWithIntervals vestingWallet = IVestingWalletWithIntervals(
+            userVestingWallets[msg.sender]
+        );
+
+        vestingWallet.release(address(token)); // Releases the ICO token
     }
 
-    // Release tokens from all of a user's vesting wallets
-    function releaseAllVestedTokens() external nonReentrant {
-        address[] memory userWallets = userVestingWallets[msg.sender];
-        require(userWallets.length > 0, "No vesting wallets found");
+    /**
+     * @dev Returns the amount of tokens that have vested for a user at the current block timestamp.
+     * @param user The address of the user to check
+     * @return The amount of vested tokens (in wei)
+     */
+    function getVestedTokens(address user) external view returns (uint256) {
+        require(
+            userVestingWallets[user] != address(0),
+            "No vesting wallet found"
+        );
 
-        for (uint i = 0; i < userWallets.length; i++) {
-            IVestingWalletWithIntervals wallet = IVestingWalletWithIntervals(
-                userWallets[i]
-            );
-            if (wallet.releasable(address(token)) > 0) {
-                wallet.release(address(token));
-            }
-        }
+        IVestingWalletWithIntervals vestingWallet = IVestingWalletWithIntervals(
+            userVestingWallets[user]
+        );
+
+        // Returns vested tokens up to current time
+        return
+            vestingWallet.vestedAmount(address(token), uint64(block.timestamp));
+    }
+
+    /**
+     * @dev Returns the amount of tokens already claimed by the user.
+     * @param user The address of the user to check
+     * @return The amount of claimed tokens (in wei)
+     */
+    function getClaimedTokens(address user) external view returns (uint256) {
+        require(
+            userVestingWallets[user] != address(0),
+            "No vesting wallet found"
+        );
+
+        IVestingWalletWithIntervals vestingWallet = IVestingWalletWithIntervals(
+            userVestingWallets[user]
+        );
+
+        return vestingWallet.released(address(token));
     }
 }
