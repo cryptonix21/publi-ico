@@ -29,8 +29,12 @@ interface IVestingWalletWithIntervals {
     function getReleaseTimestamps() external view returns (uint256[] memory);
 
     function owner() external view returns (address);
+<<<<<<< HEAD
 
     function vestedAmount(uint64 timestamp) external view returns (uint256);
+=======
+function vestedAmount(uint64 timestamp) external view returns (uint256);
+>>>>>>> 466e06ab5654751eb8037beec305b37db954ca7f
 
     function vestedAmount(
         address token,
