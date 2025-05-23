@@ -2,12 +2,12 @@
 pragma solidity ^0.8.20;
 
 import "./IVestingInterfaces.sol";
-import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/token/ERC20/IERC20.sol";
-import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/token/ERC20/utils/SafeERC20.sol";
-import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/utils/Address.sol";
-import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/access/Ownable.sol";
-import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/utils/ReentrancyGuard.sol";
-import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/utils/Pausable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/utils/Address.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
 
 /**
  * @title TokenICO
@@ -23,7 +23,7 @@ contract TokenICO is Ownable, ReentrancyGuard, Pausable {
     uint256 public startTime;
     uint256 public endTime;
     uint256 public tokenPriceInWei = 0.002 ether; // 0.002 ETH per token
-    uint256 public hardcapInTokens = 200_000_000 * (10 ** 18); // 200M tokens
+    uint256 public hardcapInTokens = 200_000_000 * (10**18); // 200M tokens
     uint256 public minEthPurchase = 0.003 ether; // 0.003 ETH min
     uint256 public maxEthPurchase = 200 ether; // 200 ETH max
     uint256 public tokensSold;
@@ -34,24 +34,29 @@ contract TokenICO is Ownable, ReentrancyGuard, Pausable {
     bool public vestingEnabled;
     uint64 public vestingDuration;
     uint64 public vestingCliff;
-    uint64 public releaseInterval; // Time between each token release
+    uint64 public releaseInterval;
     bool public icoFinalized;
     uint256 public unsoldTokensApproved;
 
-    // Mapping of user addresses to their vesting wallet addresses
-    mapping(address => address[]) public userVestingWallets;
+    struct VestingBalance {
+        address walletAddress;
+        uint256 initialAmount;
+        uint256 releasedAmount;
+        uint64 startTime;
+        uint64 duration;
+        uint64 cliff;
+        uint64 interval;
+    }
 
-    // Mapping to track total tokens allocated to vesting per user
-    mapping(address => uint256) public userVestedTokens;
-
-    // Mapping to track tokens in each vesting wallet
-    mapping(address => uint256) public vestingWalletTokens;
+    mapping(address => VestingBalance[]) public userVestingBalances;
+    mapping(address => uint256) public userTotalVestedTokens;
 
     // **** Events **** ///
     event TokenPurchasedWithEth(
         address indexed purchaser,
         uint256 weiAmount,
-        uint256 tokenAmount
+        uint256 tokenAmount,
+        address indexed vestingWallet
     );
     event ICOStartTimeChanged(uint256 newStartTime);
     event ICOEndTimeChanged(uint256 newEndTime);
@@ -68,17 +73,13 @@ contract TokenICO is Ownable, ReentrancyGuard, Pausable {
     event VestingWalletCreated(
         address indexed user,
         address indexed vestingWallet,
-        uint256 tokenAmount
+        uint256 tokenAmount,
+        uint64 startTime,
+        uint64 duration,
+        uint64 cliff,
+        uint64 interval
     );
-    event VestingWalletFunded(address indexed vestingWallet, uint256 amount);
 
-    /**
-     * @dev Constructor
-     * @param _token Address of the token being sold
-     * @param _startTime Start time of the ICO
-     * @param _endTime End time of the ICO
-     * @param _vestingFactory Address of the vesting factory contract
-     */
     constructor(
         address _token,
         uint256 _startTime,
@@ -86,45 +87,27 @@ contract TokenICO is Ownable, ReentrancyGuard, Pausable {
         address _vestingFactory
     ) Ownable(msg.sender) {
         require(_token != address(0), "Token address cannot be zero");
-        require(
-            _vestingFactory != address(0),
-            "Vesting factory address cannot be zero"
-        );
-        require(
-            _startTime >= block.timestamp,
-            "Start time must be in the future"
-        );
+        require(_vestingFactory != address(0), "Vesting factory address cannot be zero");
+        require(_startTime >= block.timestamp, "Start time must be in the future");
         require(_endTime > _startTime, "End time must be after start time");
 
         token = IERC20(_token);
         vestingFactory = IVestingFactory(_vestingFactory);
         startTime = _startTime;
         endTime = _endTime;
-        _pause(); // Start paused
     }
 
-    /**
-     * @dev Fallback function to handle ETH transfers
-     */
     receive() external payable {
         buyTokensWithEth();
     }
 
-    /**
-     * @dev Checks if the ICO is open
-     * @return bool Whether the ICO is open
-     */
     function isOpen() public view returns (bool) {
-        return
-            block.timestamp >= startTime &&
+        return block.timestamp >= startTime &&
             block.timestamp <= endTime &&
             tokensSold < hardcapInTokens &&
             !paused();
     }
 
-    /**
-     * @dev Allows users to buy tokens with ETH
-     */
     function buyTokensWithEth() public payable nonReentrant whenNotPaused {
         require(isOpen(), "ICO is not open");
         require(msg.value >= minEthPurchase, "Amount < min purchase");
@@ -132,59 +115,60 @@ contract TokenICO is Ownable, ReentrancyGuard, Pausable {
 
         uint256 tokens = calculateTokenAmount(msg.value);
         require(tokensSold + tokens <= hardcapInTokens, "Exceeds hardcap");
+        require(token.balanceOf(address(this)) >= tokens, "ICO contract has insufficient tokens");
 
         tokensSold += tokens;
         weiRaised += msg.value;
 
         if (vestingEnabled) {
-            // Always create a new vesting wallet for each purchase
             address vestingWallet = vestingFactory.createVestingWallet(
-                msg.sender, // beneficiary
-                uint64(block.timestamp), // startTimestamp - current time for each purchase
-                vestingDuration, // durationSeconds
-                vestingCliff, // cliffSeconds
-                releaseInterval // releaseIntervalSeconds
+                msg.sender,
+                uint64(block.timestamp),
+                vestingDuration,
+                vestingCliff,
+                releaseInterval
             );
+            
+            require(vestingWallet != address(0), "Vesting wallet creation failed");
 
-            // Add to array of user's vesting wallets
-            userVestingWallets[msg.sender].push(vestingWallet);
+            userVestingBalances[msg.sender].push(VestingBalance({
+                walletAddress: vestingWallet,
+                initialAmount: tokens,
+                releasedAmount: 0,
+                startTime: uint64(block.timestamp),
+                duration: vestingDuration,
+                cliff: vestingCliff,
+                interval: releaseInterval
+            }));
 
-            // Track tokens in this specific wallet
-            vestingWalletTokens[vestingWallet] = tokens;
-
-            // Send tokens to the new vesting wallet
             token.safeTransfer(vestingWallet, tokens);
-            userVestedTokens[msg.sender] += tokens;
+            userTotalVestedTokens[msg.sender] += tokens;
 
-            emit VestingWalletCreated(msg.sender, vestingWallet, tokens);
-            emit VestingWalletFunded(vestingWallet, tokens);
+            emit VestingWalletCreated(
+                msg.sender,
+                vestingWallet,
+                tokens,
+                uint64(block.timestamp),
+                vestingDuration,
+                vestingCliff,
+                releaseInterval
+            );
+            emit TokenPurchasedWithEth(msg.sender, msg.value, tokens, vestingWallet);
         } else {
-            // Direct transfer if vesting is not enabled
+            uint256 initialRecipientBalance = token.balanceOf(msg.sender);
             token.safeTransfer(msg.sender, tokens);
+            require(
+                token.balanceOf(msg.sender) == initialRecipientBalance + tokens,
+                "Direct transfer failed"
+            );
+            emit TokenPurchasedWithEth(msg.sender, msg.value, tokens, address(0));
         }
-
-        emit TokenPurchasedWithEth(msg.sender, msg.value, tokens);
     }
 
-    /**
-     * @dev Calculate the amount of tokens for a given amount of ETH
-     * @param _amount Amount of ETH (in wei)
-     * @return uint256 Number of tokens
-     */
-    function calculateTokenAmount(
-        uint256 _amount
-    ) public view returns (uint256) {
+    function calculateTokenAmount(uint256 _amount) public view returns (uint256) {
         return _amount / tokenPriceInWei;
     }
 
-    // ***** Owner Functions ***** //
-
-    /**
-     * @dev Configure vesting parameters
-     * @param _duration Duration of vesting in seconds
-     * @param _cliff Cliff period in seconds
-     * @param _interval Time between each token release in seconds
-     */
     function configureVesting(
         uint64 _duration,
         uint64 _cliff,
@@ -199,31 +183,17 @@ contract TokenICO is Ownable, ReentrancyGuard, Pausable {
         emit VestingConfigured(_duration, _cliff, _interval);
     }
 
-    /**
-     * @dev Disable vesting
-     */
     function disableVesting() external onlyOwner {
         vestingEnabled = false;
     }
 
-    /**
-     * @dev Update ICO start time
-     * @param _startTime New Start time
-     */
     function setStartTime(uint256 _startTime) external onlyOwner {
-        require(
-            _startTime >= block.timestamp,
-            "Start time must be in the future"
-        );
+        require(_startTime >= block.timestamp, "Start time must be in the future");
         require(_startTime < endTime, "Start time must be before end time");
         startTime = _startTime;
         emit ICOStartTimeChanged(_startTime);
     }
 
-    /**
-     * @dev Update ICO end time
-     * @param _endTime New end time
-     */
     function setEndTime(uint256 _endTime) external onlyOwner {
         require(_endTime > block.timestamp, "End time must be in the future");
         require(_endTime > startTime, "End time must be after start time");
@@ -231,72 +201,37 @@ contract TokenICO is Ownable, ReentrancyGuard, Pausable {
         emit ICOEndTimeChanged(_endTime);
     }
 
-    /**
-     * @dev Update token prices
-     * @param _tokenPriceInWei New token price in wei
-     */
     function setTokenPrices(uint256 _tokenPriceInWei) external onlyOwner {
-        require(
-            _tokenPriceInWei > 0,
-            "Token price in wei must be greater than 0"
-        );
-
+        require(_tokenPriceInWei > 0, "Token price in wei must be greater than 0");
         tokenPriceInWei = _tokenPriceInWei;
         emit TokenPriceChanged(_tokenPriceInWei);
     }
 
-    /**
-     * @dev Update hardcap
-     * @param _hardcapInTokens New hardcap in tokens
-     */
     function setHardcap(uint256 _hardcapInTokens) external onlyOwner {
-        require(
-            _hardcapInTokens > tokensSold,
-            "New hardcap must be greater than tokens sold"
-        );
+        require(_hardcapInTokens > tokensSold, "New hardcap must be greater than tokens sold");
         hardcapInTokens = _hardcapInTokens;
         emit HardCapChanged(_hardcapInTokens);
     }
 
-    /**
-     * @dev Update eth purchase limits
-     * @param _minEthPurchase New minimum purchase amount
-     * @param _maxEthPurchase New maximum purchase amount
-     */
     function setEthPurchaseLimits(
         uint256 _minEthPurchase,
         uint256 _maxEthPurchase
     ) external onlyOwner {
         require(_minEthPurchase > 0, "Min purchase must be greater than 0");
-        require(
-            _maxEthPurchase >= _minEthPurchase,
-            "Max purchase must be greater or equal to min purchase"
-        );
+        require(_maxEthPurchase >= _minEthPurchase, "Max purchase must be greater or equal to min purchase");
         minEthPurchase = _minEthPurchase;
         maxEthPurchase = _maxEthPurchase;
     }
 
-    /**
-     * @dev Pause the ICO
-     */
     function pause() external onlyOwner {
         _pause();
     }
 
-    /**
-     * @dev Unpause the ICO
-     */
     function unpause() external onlyOwner {
         _unpause();
     }
 
-    /**
-     * @dev Withdraw collected ETH
-     * @param _wallet Address to send ETH to
-     */
-    function withdrawEth(
-        address payable _wallet
-    ) external onlyOwner nonReentrant {
+    function withdrawEth(address payable _wallet) external onlyOwner nonReentrant {
         require(_wallet != address(0), "Invalid address");
         uint256 amount = address(this).balance;
         require(amount > 0, "No ETH");
@@ -307,170 +242,142 @@ contract TokenICO is Ownable, ReentrancyGuard, Pausable {
         emit FundsWithdrawn(_wallet, amount, address(0));
     }
 
-    /**
-     * @dev Finalize the ICO, calculate unsold tokens
-     */
     function finalizeIco() external onlyOwner {
-        require(
-            block.timestamp > endTime || tokensSold >= hardcapInTokens,
-            "ICO still active"
-        );
+        require(block.timestamp > endTime || tokensSold >= hardcapInTokens, "ICO still active");
         require(!icoFinalized, "Already finalized");
 
-        // Calculate unsold tokens
         unsoldTokensApproved = token.balanceOf(address(this));
-
         icoFinalized = true;
         emit IcoFinalized(unsoldTokensApproved);
     }
 
-    /**
-     * @dev Withdraw unsold tokens after ICO finalization
-     * @param _wallet Address to send unsold tokens to
-     */
-    function withdrawUnsoldTokens(
-        address _wallet
-    ) external onlyOwner nonReentrant {
+    function withdrawUnsoldTokens(address _wallet) external onlyOwner nonReentrant {
         require(_wallet != address(0), "Invalid address");
         require(icoFinalized, "ICO not finalized");
         require(unsoldTokensApproved > 0, "No tokens approved");
 
         uint256 amount = unsoldTokensApproved;
-        unsoldTokensApproved = 0; // Prevent reentrancy and reuse
+        unsoldTokensApproved = 0;
 
         token.safeTransfer(_wallet, amount);
         emit UnsoldTokensWithdrawn(_wallet, amount);
     }
 
-    // Update the getVestingDetails function to return data about all wallets
-    function getVestingWallets(
-        address _user
-    ) external view returns (address[] memory) {
-        return userVestingWallets[_user];
-    }
-
-    // Get details for a specific wallet
-    function getVestingWalletDetails(
-        address _wallet
-    )
-        external
-        view
-        returns (
-            uint256 vestedAmount,
-            uint256 vestingStart,
-            uint256 vestingEnd,
-            uint256 vestingCliffEnd,
-            uint256[] memory intervals
-        )
-    {
-        require(_wallet != address(0), "Invalid wallet address");
-
-        IVestingWalletWithIntervals vestingWallet = IVestingWalletWithIntervals(
-            _wallet
-        );
-        vestedAmount = vestingWalletTokens[_wallet];
-        vestingStart = vestingWallet.start();
-        vestingEnd = vestingStart + vestingWallet.duration();
-        vestingCliffEnd = vestingStart + vestingWallet.cliff();
-        intervals = vestingWallet.getReleaseTimestamps();
-
-        return (
-            vestedAmount,
-            vestingStart,
-            vestingEnd,
-            vestingCliffEnd,
-            intervals
-        );
-    }
-
-<<<<<<< HEAD
-    // Release tokens from a specific vesting wallet
-    function releaseVestedTokens(address vestingWallet) external nonReentrant {
-        bool isUsersWallet = false;
-        address[] memory userWallets = userVestingWallets[msg.sender];
-
-        for (uint i = 0; i < userWallets.length; i++) {
-            if (userWallets[i] == vestingWallet) {
-                isUsersWallet = true;
-                break;
-            }
+    function getVestingWalletBalances(address user) public view returns (
+        address[] memory wallets,
+        uint256[] memory initialAmounts,
+        uint256[] memory vestedAmounts,
+        uint256[] memory releasableAmounts,
+        uint256[] memory remainingAmounts
+    ) {
+        VestingBalance[] storage balances = userVestingBalances[user];
+        uint256 count = balances.length;
+        
+        wallets = new address[](count);
+        initialAmounts = new uint256[](count);
+        vestedAmounts = new uint256[](count);
+        releasableAmounts = new uint256[](count);
+        remainingAmounts = new uint256[](count);
+        
+        for (uint i = 0; i < count; i++) {
+            VestingBalance memory balance = balances[i];
+            IVestingWalletWithIntervals wallet = IVestingWalletWithIntervals(balance.walletAddress);
+            
+            wallets[i] = balance.walletAddress;
+            initialAmounts[i] = balance.initialAmount;
+            vestedAmounts[i] = wallet.vestedAmount(address(token), uint64(block.timestamp));
+            releasableAmounts[i] = wallet.releasable(address(token));
+            remainingAmounts[i] = balance.initialAmount - vestedAmounts[i];
         }
-
-        require(isUsersWallet, "Not your vesting wallet");
-
-        IVestingWalletWithIntervals wallet = IVestingWalletWithIntervals(
-            vestingWallet
-        );
-        wallet.release(address(token));
     }
 
-    // Release tokens from all of a user's vesting wallets
+    function getVestingWalletCount(address user) external view returns (uint256) {
+        return userVestingBalances[user].length;
+    }
+
     function releaseAllVestedTokens() external nonReentrant {
-        address[] memory userWallets = userVestingWallets[msg.sender];
-        require(userWallets.length > 0, "No vesting wallets found");
+        VestingBalance[] storage balances = userVestingBalances[msg.sender];
+        require(balances.length > 0, "No vesting wallets found");
 
-        for (uint i = 0; i < userWallets.length; i++) {
-            IVestingWalletWithIntervals wallet = IVestingWalletWithIntervals(
-                userWallets[i]
-            );
-            if (wallet.releasable(address(token)) > 0) {
+        for (uint256 i = 0; i < balances.length; i++) {
+            IVestingWalletWithIntervals wallet = IVestingWalletWithIntervals(balances[i].walletAddress);
+            uint256 releasable = wallet.releasable(address(token));
+            if (releasable > 0) {
                 wallet.release(address(token));
+                balances[i].releasedAmount += releasable;
             }
         }
-=======
-
-    /**
-     * @dev Allows users to release their vested tokens via the ICO contract.
-     */
-    function releaseVestedTokens() external nonReentrant {
-        require(
-            userVestingWallets[msg.sender] != address(0),
-            "No vesting wallet found"
-        );
-
-        IVestingWalletWithIntervals vestingWallet = IVestingWalletWithIntervals(
-            userVestingWallets[msg.sender]
-        );
-
-        vestingWallet.release(address(token)); // Releases the ICO token
     }
 
-    /**
-     * @dev Returns the amount of tokens that have vested for a user at the current block timestamp.
-     * @param user The address of the user to check
-     * @return The amount of vested tokens (in wei)
-     */
-    function getVestedTokens(address user) external view returns (uint256) {
-        require(
-            userVestingWallets[user] != address(0),
-            "No vesting wallet found"
-        );
+    function releaseVestedTokens(uint256 walletIndex) external nonReentrant {
+        VestingBalance[] storage balances = userVestingBalances[msg.sender];
+        require(walletIndex < balances.length, "Invalid wallet index");
 
-        IVestingWalletWithIntervals vestingWallet = IVestingWalletWithIntervals(
-            userVestingWallets[user]
-        );
-
-        // Returns vested tokens up to current time
-        return
-            vestingWallet.vestedAmount(address(token), uint64(block.timestamp));
+        IVestingWalletWithIntervals wallet = IVestingWalletWithIntervals(balances[walletIndex].walletAddress);
+        uint256 releasable = wallet.releasable(address(token));
+        if (releasable > 0) {
+            wallet.release(address(token));
+            balances[walletIndex].releasedAmount += releasable;
+        }
     }
 
-    /**
-     * @dev Returns the amount of tokens already claimed by the user.
-     * @param user The address of the user to check
-     * @return The amount of claimed tokens (in wei)
-     */
-    function getClaimedTokens(address user) external view returns (uint256) {
-        require(
-            userVestingWallets[user] != address(0),
-            "No vesting wallet found"
-        );
-
-        IVestingWalletWithIntervals vestingWallet = IVestingWalletWithIntervals(
-            userVestingWallets[user]
-        );
-
-        return vestingWallet.released(address(token));
->>>>>>> 466e06ab5654751eb8037beec305b37db954ca7f
+    function getTotalReleasable(address user) external view returns (uint256 totalReleasable) {
+        VestingBalance[] storage balances = userVestingBalances[user];
+        for (uint256 i = 0; i < balances.length; i++) {
+            totalReleasable += IVestingWalletWithIntervals(balances[i].walletAddress)
+                .releasable(address(token));
+        }
+        return totalReleasable;
     }
+
+    function getWalletReleasable(address user, uint256 walletIndex) external view returns (uint256) {
+        VestingBalance[] storage balances = userVestingBalances[user];
+        require(walletIndex < balances.length, "Invalid wallet index");
+        return IVestingWalletWithIntervals(balances[walletIndex].walletAddress)
+            .releasable(address(token));
+    }
+/**
+ * @dev Get all release timestamps for a specific vesting wallet
+ * @param user The user address
+ * @param walletIndex Index of the vesting wallet
+ * @return purchaseTime When tokens were purchased/vesting started
+ * @return cliffEndTime When cliff period ends
+ * @return releaseTimes Array of all release timestamps after cliff
+ */
+function getVestingReleaseSchedule(address user, uint256 walletIndex)
+    public
+    view
+    returns (
+        uint256 purchaseTime,
+        uint256 cliffEndTime,
+        uint256[] memory releaseTimes
+    )
+{
+    require(walletIndex < userVestingBalances[user].length, "Invalid wallet index");
+    
+    VestingBalance memory balance = userVestingBalances[user][walletIndex];
+    purchaseTime = balance.startTime;
+    cliffEndTime = purchaseTime + balance.cliff;
+    
+    // Calculate total number of releases
+    uint256 vestingDurationAfterCliff = balance.duration - balance.cliff;
+    uint256 totalReleases = vestingDurationAfterCliff / balance.interval;
+    if (vestingDurationAfterCliff % balance.interval != 0) {
+        totalReleases += 1;
+    }
+    
+    // Generate all release timestamps
+    releaseTimes = new uint256[](totalReleases);
+    uint256 currentReleaseTime = cliffEndTime;
+    uint256 vestingEnd = purchaseTime + balance.duration;
+    
+    for (uint256 i = 0; i < totalReleases; i++) {
+        releaseTimes[i] = currentReleaseTime;
+        if (currentReleaseTime + balance.interval > vestingEnd) {
+            currentReleaseTime = vestingEnd;
+        } else {
+            currentReleaseTime += balance.interval;
+        }
+    }
+}
 }
